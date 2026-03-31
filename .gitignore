@@ -1,0 +1,28 @@
+# Project-specific ignores
+LLaMA-Factory/arpo_train_sft/dataset/*.jsonl
+LLaMA-Factory/LLaMA-Factory-backup
+
+# OS / editor
+.DS_Store
+**/.DS_Store
+.vscode/
+.idea/
+
+# Python caches and envs
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+**/.venv/
+venv/
+**/venv/
+.env
+.env.*
+
+# Logs / temp
+*.log
+tmp/
