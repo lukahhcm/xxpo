@@ -164,6 +164,7 @@ def build_user(
     # Validate DummyUser usage
     if issubclass(UserConstructor, DummyUser):
         assert solo_mode, "Dummy user can only be used with solo agent"
+        return UserConstructor()
 
     user_kwargs = {
         "tools": user_tools,
