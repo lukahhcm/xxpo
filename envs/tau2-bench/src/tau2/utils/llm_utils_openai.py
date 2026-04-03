@@ -207,6 +207,151 @@ def _response_usage_to_dict(response: Any) -> Optional[dict]:
     }
 
 
+def _default_function_parameters_schema() -> dict:
+    return {"type": "object", "properties": {}, "required": []}
+
+
+def _normalize_function_parameters_schema(parameters: Any, tool_name: str) -> dict:
+    """
+    Normalize tool function parameters to a strict JSON object schema.
+
+    Some OpenAI-compatible backends are strict about this field and may reject
+    empty strings or non-object values.
+    """
+    if parameters is None or parameters == "":
+        logger.warning(
+            "Tool '{}' has empty parameters schema; replacing with empty object schema.",
+            tool_name,
+        )
+        return _default_function_parameters_schema()
+
+    if isinstance(parameters, str):
+        stripped = parameters.strip()
+        if not stripped:
+            logger.warning(
+                "Tool '{}' has blank parameters schema string; replacing with empty object schema.",
+                tool_name,
+            )
+            return _default_function_parameters_schema()
+        try:
+            parameters = json.loads(stripped)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Tool '{}' has invalid JSON parameters schema string; replacing with empty object schema.",
+                tool_name,
+            )
+            return _default_function_parameters_schema()
+
+    if not isinstance(parameters, dict):
+        logger.warning(
+            "Tool '{}' has non-dict parameters schema (type={}); replacing with empty object schema.",
+            tool_name,
+            type(parameters).__name__,
+        )
+        return _default_function_parameters_schema()
+
+    normalized = dict(parameters)
+    normalized["type"] = "object"
+
+    props = normalized.get("properties")
+    if not isinstance(props, dict):
+        normalized["properties"] = {}
+
+    required = normalized.get("required")
+    if required is None:
+        normalized["required"] = []
+    elif isinstance(required, list):
+        normalized["required"] = [x for x in required if isinstance(x, str)]
+    elif isinstance(required, str):
+        normalized["required"] = [required] if required else []
+    else:
+        normalized["required"] = []
+
+    return normalized
+
+
+def _sanitize_tools_schema(tools_schema: Optional[list[dict]]) -> Optional[list[dict]]:
+    """
+    Sanitize tool schema list for stricter OpenAI-compatible backends.
+    """
+    if not tools_schema:
+        return None
+
+    sanitized: list[dict] = []
+    for i, tool_schema in enumerate(tools_schema):
+        if not isinstance(tool_schema, dict):
+            logger.warning(
+                "Skipping non-dict tool schema at index {} (type={}).",
+                i,
+                type(tool_schema).__name__,
+            )
+            continue
+
+        fn = tool_schema.get("function")
+        if not isinstance(fn, dict):
+            logger.warning(
+                "Skipping tool schema at index {} with missing function object.", i
+            )
+            continue
+
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            logger.warning(
+                "Skipping tool schema at index {} with invalid function name.", i
+            )
+            continue
+
+        description = fn.get("description")
+        if not isinstance(description, str) or not description:
+            description = name
+
+        parameters = _normalize_function_parameters_schema(
+            fn.get("parameters"), tool_name=name
+        )
+
+        sanitized.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+            }
+        )
+
+    return sanitized or None
+
+
+def _minimal_tools_schema(tools_schema: Optional[list[dict]]) -> Optional[list[dict]]:
+    """
+    Build a minimal fallback tool schema for stricter backends.
+    """
+    if not tools_schema:
+        return None
+
+    minimal: list[dict] = []
+    for tool_schema in tools_schema:
+        fn = tool_schema.get("function", {})
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        desc = fn.get("description")
+        if not isinstance(desc, str) or not desc:
+            desc = name
+        minimal.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": _default_function_parameters_schema(),
+                },
+            }
+        )
+    return minimal or None
+
+
 def generate(
     model: str,
     messages: list[Message],
@@ -228,6 +373,8 @@ def generate(
 
     openai_messages = to_openai_messages(messages)
     tools_schema = [tool.openai_schema for tool in tools] if tools else None
+    tools_schema = _sanitize_tools_schema(tools_schema)
+
     if tools_schema and tool_choice is None:
         tool_choice = "auto"
 
@@ -271,8 +418,32 @@ def generate(
     try:
         response = client.chat.completions.create(**request_payload)
     except Exception as e:
-        logger.error(e)
-        raise e
+        err_text = str(e)
+        should_retry_with_minimal_tools = (
+            request_payload.get("tools") is not None
+            and ("json_invalid" in err_text or "Invalid JSON" in err_text)
+        )
+
+        if should_retry_with_minimal_tools:
+            minimal_tools = _minimal_tools_schema(request_payload.get("tools"))
+            if minimal_tools:
+                logger.warning(
+                    "Backend rejected tool schema as invalid JSON; retrying with minimal tool schemas."
+                )
+                request_payload["tools"] = minimal_tools
+                request_data["tools"] = minimal_tools
+                try:
+                    response = client.chat.completions.create(**request_payload)
+                except Exception as e2:
+                    logger.error(e2)
+                    raise e2
+            else:
+                logger.error(e)
+                raise e
+        else:
+            logger.error(e)
+            raise e
+
     generation_time_seconds = time.perf_counter() - start_time
 
     usage = _response_usage_to_dict(response)
@@ -289,12 +460,17 @@ def generate(
 
     tool_calls: list[ToolCall] = []
     for tool_call in raw_tool_calls:
-        arguments_raw = tool_call.function.arguments or "{}"
+        arguments_raw = tool_call.function.arguments
+        if arguments_raw is None or arguments_raw == "":
+            arguments_raw = "{}"
+        elif not isinstance(arguments_raw, str):
+            arguments_raw = json.dumps(arguments_raw)
+
         try:
             arguments = json.loads(arguments_raw)
         except json.JSONDecodeError:
             logger.warning(
-                "Tool call arguments are not valid JSON; preserving raw string. tool=%s args=%s",
+                "Tool call arguments are not valid JSON; preserving raw string. tool={} args={}",
                 tool_call.function.name,
                 arguments_raw,
             )
